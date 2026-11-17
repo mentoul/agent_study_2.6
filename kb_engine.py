@@ -1,7 +1,15 @@
 from __future__ import annotations
 import os
-import hashlib
+from functools import lru_cache
+from langfuse import observe, get_client
+
 import numpy as np
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+from sentence_transformers import SentenceTransformer
+
+EMBED_MODEL_NAME = "BAAI/bge-small-zh-v1.5"   # 512 维，中文，CPU 可跑
+EMBED_DIM = 512
+QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
 def load_kb(root_dir:str,chunk_size=300,overlap=50,split_strategy="sentence")->tuple[list[dict],dict]:
     doc_cnt,chunk_cnt=0,0
@@ -93,20 +101,35 @@ def chunk_text(text,chunk_size=300,overlap=50,split_strategy="sentence")->list[d
         start=next_start
     return chunks
 
-def pseudo_embed(text:str,dim:int=128)->np.ndarray:
-    seed=int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8],"little")
-    rng=np.random.default_rng(seed)
-    vec=rng.standard_normal(dim)
-    #归一化
-    norm=np.linalg.norm(vec)    #求向量的模
-    return vec/norm
+@lru_cache(maxsize=1)
+def _get_embedder() -> SentenceTransformer:
+    #第一次调用会下载模型，之后本地缓存
+    return SentenceTransformer(EMBED_MODEL_NAME)
+
+@observe(name="bge_embed", as_type="embedding",
+        capture_input=False, capture_output=False)
+def embed_texts(texts:list[str])->np.ndarray:
+    "批量编码文档，返回(n,512)的归一化向量"
+    model=_get_embedder()
+    vecs=model.encode(
+        texts,
+        batch_size=32,  #一次性打包32条给模型
+        normalize_embeddings=True,  #向量归一化
+        convert_to_numpy=True,  #直接输出numpy数组
+        show_progress_bar=False,  #关掉进度条，Streamlit 页面不会乱打印日志
+    )
+    #sentence-transformers 的 encode，默认出来的向量是float32或者float64的numpy数组。
+    return np.asarray(vecs,dtype=np.float32)
+
+def embed_query(text:str)->np.ndarray:
+    return embed_texts([QUERY_INSTRUCTION+text])[0]
 
 
 def cosine_similarity(a:np.ndarray,b:np.ndarray)->float:
     return float(np.dot(a,b))
 
 class SimpleVectorStore:    
-    def __init__(self,dim:int=128):
+    def __init__(self,dim:int=EMBED_DIM):
         self.dim=dim  #向量维度
         self.vectors:list[np.ndarray]=[]   #向量仓库
         self.documents:list[str]=[]      #保存原始文本
@@ -129,20 +152,29 @@ class SimpleVectorStore:
             raise ValueError(
                 f"texts/metadatas/ids 长度不一致：{len(texts)}/{len(metadatas)}/{len(ids)}"
             )
-        for text,meta,doc_id in zip (texts,metadatas,ids):
-            self.vectors.append(pseudo_embed(text,self.dim))    #pseudo_embed()生成伪向量，追加到vectors列表
+        vecs=embed_texts(texts)
+        for vec,text,meta,doc_id in zip (vecs,texts,metadatas,ids):
+            self.vectors.append(vec)    #pseudo_embed()生成伪向量，追加到vectors列表
             self.documents.append(text)
             self.metadata.append(meta)
             self.ids.append(doc_id)
         return ids
-    
+    @observe(
+            name="bi_retrieve",
+            as_type="retriever",
+            capture_input=False,
+            capture_output=False
+            )
     def query(self,query_text:str,top_k:int=5,metadata_filter:dict=None)->list[dict]:    #metadata_filter元数据过滤条件
         """
         语义检索：返回TopK最相似的文档
         """
+        get_client().update_current_span(
+            input={"query": query_text, "top_k": top_k}
+        )
         if not self.vectors:
             return []
-        q_vec=pseudo_embed(query_text,self.dim)
+        q_vec=embed_query(query_text)
         scores=[cosine_similarity(q_vec,v)for v in self.vectors]
 
         ranked=sorted(
@@ -165,6 +197,11 @@ class SimpleVectorStore:
             })
             if len(results)>=top_k:
                 break
+
+        get_client().update_current_span(
+            output=[{"id": r["id"], "score": round(r["similarity"], 4)}
+                    for r in results]
+        )        
         return results
 
 
@@ -188,8 +225,13 @@ def cross_encoder_score(query:str,document:str)->float:
             score+=min(tf,5)*0.03
     return min(score,1.0)
 
+@observe(name="two_stage_retrieve", as_type="retriever",
+         capture_input=False, capture_output=False)
 def two_stage_retrieve(query:str,store:SimpleVectorStore,recall_k:int=10,final_k:int=3)->list[dict]:
     """两阶段检索: Bi-Encoder 召回 + Cross-Encoder 精排"""
+    get_client().update_current_span(
+        input={"query": query, "recall_k": recall_k, "final_k": final_k}
+    )
     #stage1:Bi粗召回10条
     candidates=store.query(query,top_k=recall_k)
     #stage2:模拟Cross-Encoder打分重排
@@ -202,6 +244,11 @@ def two_stage_retrieve(query:str,store:SimpleVectorStore,recall_k:int=10,final_k
     for idx,item in enumerate(final_res,start=1):
         item["ref_id"]=f"[{idx}]"
 
+    get_client().update_current_span(
+        output=[{"id": c["id"], "rerank": c["rerank_score"]}
+                for c in final_res],
+        metadata={"recall_count": len(candidates)},
+    )
     return final_res
 
 if __name__=="__main__":
@@ -211,7 +258,7 @@ if __name__=="__main__":
         overlap=26,
         split_strategy="sentence",
     )
-    store = SimpleVectorStore(dim=128)
+    store = SimpleVectorStore(dim=512)
     store.add(
         texts=[c["text"]for c in chunk_list],
         metadatas=[c["meta"]for c in chunk_list],

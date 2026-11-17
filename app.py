@@ -1,21 +1,29 @@
-import streamlit as st
+import os
 from pathlib import Path
+
+import streamlit as st
+from dotenv import load_dotenv
+from langfuse import observe, propagate_attributes, get_client
+from langfuse.openai import OpenAI
 
 from kb_engine import(
     cross_encoder_score,
     SimpleVectorStore,
     two_stage_retrieve,
-    load_kb
+    load_kb,
 )
+#.resolve拿到绝对路径，去掉相对路径,.parent:当前文件所在文件夹
+load_dotenv(Path(__file__).resolve().parent/".env")
 
 st.set_page_config(page_title="RAG两阶段检索演示",layout="wide")  #layout="wide"：宽屏模式
 st.title("RAG|Bi-Encoder召回+Cross-Encoder重排演示系统")   #页面顶部最大标题
+
 KB_DIR = Path(__file__).resolve().parent / "kb_documents"
 
 @st.cache_resource   #Streamlit 缓存装饰器
 def load_knowledge_base():
     """加载知识库，构建向量库"""
-    store=SimpleVectorStore(dim=128)
+    store=SimpleVectorStore(dim=512)
     #加载文档
     chunk_list,stat_info=load_kb(
         root_dir=str(KB_DIR),
@@ -29,8 +37,85 @@ def load_knowledge_base():
         metadatas=[c["meta"]for c in chunk_list],
     )
     return store,chunk_list,stat_info   #stat_info:知识库统计信息字典
+try:
+    with st.spinner("正在加载知识库并计算向量..."):  #spinner 就是页面上的**加载转圈动画**
+        store,all_chunks,kb_stat=load_knowledge_base()#分别接收store,chunk_list,stat_info
+except Exception as e:
+    st.error(f"知识库或 Embedding 模型加载失败：{e}")   #红色报错框
+    st.stop()    #直接终止整个 Streamlit 脚本
 
-store,all_chunks,kb_stat=load_knowledge_base()    #分别接收store,chunk_list,stat_info 
+@st.cache_resource
+def get_llm_client():
+    api_key=os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("没有找到 DEEPSEEK_API_KEY，请检查项目目录下的 .env")
+    return OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("DEEPSEEK_BASE_URL"),
+        timeout=60.0,
+    )
+
+SYSTEM_PROMPT="""你是一个严谨的技术问答助手。请严格根据【参考资料】回答问题：
+        1. 只能使用资料中的信息，不要编造，不要使用资料以外的知识；
+        2. 每个关键结论后面用 [编号] 标注来源，例如 [1]、[2]；
+        3. 如果资料不足以回答，直接说“资料中没有找到相关内容”；
+        4. 用中文回答，条理清晰；涉及操作时给出步骤和命令。"""
+
+    
+def bulid_context(results:list[dict])->str:
+    lines=[]
+    for i,item in enumerate(results,1):
+        meta=item["metadata"]
+        lines.append(
+            f"[{i}领域:{meta['domain']}|文件:{meta['source_file']}"
+            f"|chunk:{meta['chunk_id']}\n{item['document']}"
+        )
+    return "\n\n".join(lines)
+    
+@observe(name="generate_answer", capture_input=False, capture_output=False)
+def generate_answer(query:str,results:list[dict])->str:
+    get_client().update_current_span(
+    input={"query": query,
+            "refs": [r["id"] for r in results]}
+    )
+    context=bulid_context(results)
+    user_prompt=f"【参考资料】\n{context}\n\n【问题】\n{query}"
+    resp=get_llm_client().chat.completions.create(
+        model=os.getenv("DEEPSEEK_MODEL","deepseek-chat"),
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+        max_tokens=1000,
+    )
+    answer = (resp.choices[0].message.content or "").strip()
+    get_client().update_current_span(output={"answer": answer})
+    return answer
+@observe(name="rag_pipeline", capture_input=False, capture_output=False)
+def answer_question(query,store,recall_k,final_k):
+    get_client().update_current_span(
+        input={"query":query,"recall_k":recall_k,"final_k":final_k}
+    )  #get_client()拿到全局的追踪 SDK 客户端实例;update_current_span:更新当前正在运行的 span（链路节点）;给这个追踪节点，记录它的入参
+    results=two_stage_retrieve(
+        query,store,recall_k=recall_k,final_k=final_k
+    )
+    if not results:
+        answer="未检索到相关片段。"
+    else:
+        answer=generate_answer(query,results)
+
+    get_client().update_current_span(
+        output={
+            "answer":answer,
+            "refs":[
+                f"{r['ref_id']}{r['metadata']['source_file']}"
+                for r in results
+            ],
+        }
+    )
+    return answer,results
+
 #拆分tab
 tab1,tab2,tab3=st.tabs(["聊天界面","知识库统计面板","检索过程可视化"])  #st.tabs：生成三个标签页，点击切换，对应三个模块。
 
@@ -42,48 +127,44 @@ with tab1:
         recall_k=st.number_input("Bi粗召回数量 recall_k",min_value=3,max_value=50,value=20)  #上限、下限、默认值
     with col2:
         final_k=st.number_input("最终返回TopK", min_value=1, max_value=5, value=3)
-    if st.button("发起检索&生成回答"):
+    if st.button("发起检索&生成回答",key="run_retrieval"):
         if not query.strip():   #query.strip()防止空输入
             st.warning("请先输入问题，再点击检索。")
         else:
             recall_k,final_k=int(recall_k),int(final_k)
             if final_k>recall_k:
-                st.caption(
-                    f"recall_k={recall_k}小于final_k={final_k},"
-                    f"最终最多只能返回{recall_k}条。"
-                )
                 final_k=recall_k
-        res=two_stage_retrieve(query,store,recall_k=int(recall_k),final_k=int(final_k))
-        #拼接文本，自动带上[1][2]
-        answer_text=""
-        if len(res)==0:
-            answer_text="未检索到相关片段！"
-        else:
-
-            #不调用LLM版本
-            
-            answer_text=f"基于检索到的{len(res)}条片段生成回答： \n"
-            for item in res:
-                ref=item["ref_id"]
-                domain=item["metadata"]["domain"]
-                answer_text+=f"- {domain} 相关内容参考 {ref} \n"
-        st.subheader("回答结果")  #二级小标题
-        st.markdown(answer_text)
-        st.divider()   #画一条水平分割线
-        st.subheader("应用来源溯源(校验)")   
-        st.info("下方为回答中[1][2]对应的原始chunk,可核对引用是否匹配")  #蓝色提示框
-        for item in res:
-            ref_tag=item["ref_id"]
-            #st.expander：可折叠面板
-            meta=item["metadata"]
-            with st.expander(
-                f"引用{ref_tag}|{meta['domain']}|chunk_id:{meta['chunk_id']}"
-                f"|文件:{meta['source_file']}"
+            with st.spinner("正在检索并调用大模型..."):
+                with propagate_attributes(
+                    session_id=st.session_state.get("session_id","demo-session"),   #propagate_attributes：把会话 ID、用户 ID 挂载到这次追踪链路里
+                    user_id="streamlit-user",
                 ):
-                st.write(f"doc_id:{item['id']}")
-                st.write(f"Bi相似度:{item['similarity']:.4f}")
-                st.write(f"Rerank打分：{item['rerank_score']:.4f}")
-                st.text_area("Chunk原文",value=item["document"],height=200,key=f"answer_chunk_{item['id']}")    #st.text_area:文本框，展示chunk文本，固定框高200，长文本可以滚动看
+                    answer,res=answer_question(
+                        query,store,recall_k,final_k
+                    )
+            st.subheader("回答结果")
+            st.markdown(answer)
+
+            st.divider()
+            st.subheader("应用来源溯源(校验)")   
+            st.info("下方为回答中[1][2]对应的原始chunk,可核对引用是否匹配")  #蓝色提示框
+            for item in res:
+                ref_tag=item["ref_id"]
+                #st.expander：可折叠面板
+                meta=item["metadata"]
+                with st.expander(
+                    f"引用{ref_tag}|{meta['domain']}|chunk_id:{meta['chunk_id']}"
+                    f"|文件:{meta['source_file']}"
+                    ):
+                    st.write(f"doc_id:{item['id']}")
+                    st.write(f"Bi相似度:{item['similarity']:.4f}")
+                    st.write(f"Rerank打分：{item['rerank_score']:.4f}")
+                    st.text_area(
+                        "Chunk原文",
+                        value=item["document"],
+                        height=200,
+                        key=f"answer_chunk_{item['id']}",
+                        )    #st.text_area:文本框，展示chunk文本，固定框高200，长文本可以滚动看
 with tab2:
     st.header("知识库统计&Chunk浏览")
     c1,c2,c3=st.columns(3)  #并排创建多列容器
