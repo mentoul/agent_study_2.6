@@ -1,0 +1,6 @@
+streamlit
+numpy
+sentence-transformers
+openai
+python-dotenv
+langfuse

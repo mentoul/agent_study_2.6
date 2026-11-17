@@ -1,0 +1,45 @@
+# ===== 密钥 / 环境变量 =====
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ty/
+
+# ===== 模型 / 向量缓存 =====
+models/
+embedding_cache/
+vector_store/
+*.npy
+*.npz
+
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+tmp/
+.cache/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+#==== 测试结果=====
+eval/eval_results.csv

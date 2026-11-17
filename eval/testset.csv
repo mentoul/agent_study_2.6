@@ -1,0 +1,19 @@
+query,expected_file,domain,note
+为什么 InnoDB 选择 B+ 树，而不是 B 树或哈希索引？,01-InnoDB索引与B+树.md,MySQL,B+ 树与哈希索引对比
+RR 和 RC 隔离级别下 ReadView 的生成时机有什么区别？,02-事务MVCC与锁.md,MySQL,MVCC 可见性
+一条慢 SQL 应该怎么用执行计划定位问题？,03-SQL优化与执行计划.md,MySQL,EXPLAIN 与索引
+MySQL 主从切换的步骤是什么？,04-主从复制与高可用.md,MySQL,主从与高可用
+误删了 MySQL 数据怎么恢复？,05-备份恢复与误删救援.md,MySQL,备份与 binlog 恢复
+Kubernetes Pod 的生命周期有哪些阶段？,01-架构与Pod生命周期.md,k8s,Pod 生命周期
+Deployment 滚动更新和 Service、Ingress 怎么配合？,02-Deployment-Service-Ingress.md,k8s,发布与流量入口
+K8s 调度失败、Pod Pending 应该怎么排查？,03-调度资源与弹性伸缩.md,k8s,调度与资源
+K8s ConfigMap 和 Secret 怎么挂载到 Pod？,04-存储配置与密钥.md,k8s,配置与密钥
+K8s Pod 频繁重启、CrashLoopBackOff 怎么排查？,05-故障排查与生产运维.md,k8s,故障排查
+Nginx location 的匹配顺序和优先级是什么？,01-配置结构与反向代理.md,nginx,location 匹配
+Nginx 负载均衡有哪些算法，健康检查怎么配？,02-负载均衡与上游治理.md,nginx,upstream 与健康检查
+Nginx 怎么配置 HTTPS 和 TLS 加固？,03-HTTPS与安全加固.md,nginx,HTTPS 与安全
+Nginx 性能调优常用哪些参数？,04-性能调优与排障.md,nginx,性能与缓存
+Redis 常见数据结构分别适合什么场景？,01-数据结构与典型场景.md,redis,数据结构
+Redis RDB 和 AOF 持久化有什么区别？,02-持久化与恢复.md,redis,持久化
+缓存穿透、缓存击穿、缓存雪崩分别怎么处理？,03-缓存一致性与三大问题.md,redis,缓存三大问题
+Redis 主从、Sentinel 和 Cluster 有什么区别？,04-主从哨兵与Cluster.md,redis,高可用架构
